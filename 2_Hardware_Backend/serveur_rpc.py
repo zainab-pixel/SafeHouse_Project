@@ -1,125 +1,126 @@
-print("⏳ Loading libraries...", flush=True)
-
+# Fichier: 2_Hardware_Backend/serveur_rpc.py
 import Pyro4
 import pyodbc
 import datetime
 
-# --- CONFIGURATION ---
-HOST = "127.0.0.1"
-PORT = 9090
-OBJ_ID = "safehouse"
+# --- CONFIGURATION SQL SERVER (Authentification Windows) ---
+CONN_STR = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=localhost;"
+    "DATABASE=SafeHouseDB;"
+    "Trusted_Connection=yes;"
+)
 
-# DATABASE DETAILS
-DB_SERVER = "localhost"
-DB_NAME = "SafeHouseDB"
-DRIVER = "{ODBC Driver 17 for SQL Server}"
+@Pyro4.expose # Rend la classe accessible au réseau
+class SafeHouseServer:
+    def __init__(self):
+        print("✅ Serveur RPC Démarré et prêt.")
+        # État initial (Mémoire RAM)
+        self.state = {
+            # Lumières
+            "living-light": False,
+            "kitchen-light": False,
+            "garden-light": False,
+            
+            # Climat
+            "temp": 21,
+            "eco-mode": True,
+            
+            # Sécurité
+            "alarm": True,
+            "camera": True,
+            "notification": False,
+            
+            # Garage
+            "garage-door": False, 
+            "garage-light": False,
+            
+            # Energie
+            "energy-meter": 42,
+            "energy-eco": True,
+            "ev-charge": False,
+            
+            # Arrosage
+            "watering-main": False,
+            "soil-threshold": 35
+        }
 
-@Pyro4.expose
-class SafeHouseServer(object):
-    
-    # --- 1. CONNECTION TO SQL SERVER ---
-    def get_db_connection(self):
-        try:
-            conn = pyodbc.connect(
-                f'DRIVER={DRIVER};SERVER={DB_SERVER};DATABASE={DB_NAME};Trusted_Connection=yes;'
-            )
-            return conn
-        except Exception as e:
-            print(f"❌ DB Error: {e}")
-            return None
+    def get_all_states(self):
+        """Appelé par Django au chargement de la page pour tout afficher"""
+        print(f"[LECTURE] Django demande l'état complet.")
+        return self.state
 
-    # --- 2. USER LOGIN (Check DB + Print) ---
-    def login_user(self, email, password):
-        print(f"🔑 [LOGIN] Checking user: {email} ... ", end="")
-        
-        conn = self.get_db_connection()
-        if not conn: return {"status": "error", "message": "DB Offline"}
-
-        try:
-            cursor = conn.cursor()
-            # Check dashboard_appuser table
-            cursor.execute("SELECT name, role FROM dashboard_appuser WHERE email = ? AND password = ?", (email, password))
-            row = cursor.fetchone()
-
-            if row:
-                print("✅ ACCESS GRANTED")
-                # Optional: Log the login to history
-                self.log_event("Login System", f"User {row[0]} Logged In")
-                return {"status": "success", "user": {"name": row[0], "role": row[1]}}
-            else:
-                print("❌ ACCESS DENIED")
-                return {"status": "error", "message": "Invalid Credentials"}
-        finally:
-            conn.close()
-
-    # --- 3. HARDWARE LOGS (Save + Affiche) ---
     def update_device(self, device_id, value):
-        # 1. Prepare Message
-        is_on = str(value).lower() == "true"
-        state = "ON" if is_on else "OFF"
-        icon = "💡"
+        """Appelé par Django quand on clique sur un bouton"""
+        print(f"[ACTION] Demande reçue : {device_id} -> {value}")
         
-        if "door" in device_id.lower():
-            state = "OPEN" if is_on else "CLOSED"
-            icon = "🚪"
+        # 1. Mise à jour de la mémoire
+        if device_id in self.state:
+            self.state[device_id] = value
+        else:
+            print(f"⚠️ Attention : ID inconnu '{device_id}' ajouté à l'état.")
+            self.state[device_id] = value
 
-        # 2. AFFICHE (Print to Console)
-        print(f"⚡ [ACTION] {device_id} -> {state} {icon}")
-
-        # 3. SAVE (Insert into dashboard_eventlog)
-        self.log_event(device_id, f"Turned {state}")
+        # 2. Sauvegarde dans SQL Server (Historique capteurs)
+        self._save_to_db(device_id, value)
         
-        return {"status": "success", "new_value": value}
-
-    # --- 4. SENSORS (Save + Affiche) ---
-    def send_sensor_data(self, sensor_type, value, unit):
-        # 1. AFFICHE
-        print(f"📡 [SENSOR] {sensor_type}: {value} {unit}")
-
-        # 2. SAVE (Insert into dashboard_sensordata)
-        conn = self.get_db_connection()
-        if conn:
-            try:
-                cursor = conn.cursor()
-                query = "INSERT INTO dashboard_sensordata (sensor_type, value, unit, timestamp) VALUES (?, ?, ?, GETDATE())"
-                cursor.execute(query, (sensor_type, value, unit))
-                conn.commit()
-            except Exception as e:
-                print(f"   ⚠️ Save Error: {e}")
-            finally:
-                conn.close()
+        # 3. Sauvegarde dans SQL Server (Journal des Logs)
+        description = f"L'utilisateur a changé {device_id} vers {value}"
+        self._log_event("ACTION_UTILISATEUR", description)
         
-        return {"status": "success"}
+        return True
 
-    # --- HELPER: Internal Log Saver ---
-    def log_event(self, device, action):
-        conn = self.get_db_connection()
-        if conn:
-            try:
-                cursor = conn.cursor()
-                query = "INSERT INTO dashboard_eventlog (device_id, action, user_email, timestamp) VALUES (?, ?, 'RPC_Sys', GETDATE())"
-                cursor.execute(query, (device, action))
-                conn.commit()
-            except Exception as e:
-                print(f"   ⚠️ Log Error: {e}")
-            finally:
-                conn.close()
+    def _save_to_db(self, device_id, value):
+        """Méthode privée pour écrire dans SensorData"""
+        try:
+            conn = pyodbc.connect(CONN_STR)
+            cursor = conn.cursor()
+            
+            val_float = None
+            val_string = None
+            
+            if isinstance(value, bool):
+                val_string = "ON" if value else "OFF"
+            elif isinstance(value, (int, float)):
+                val_float = float(value)
+            else:
+                val_string = str(value)
 
-# --- SERVER STARTUP ---
+            sql = """
+                INSERT INTO SensorData (sensor_type, value_float, value_string, zone)
+                VALUES (?, ?, ?, ?)
+            """
+            cursor.execute(sql, (device_id, val_float, val_string, 'maison'))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print(f"   └── 💾 Donnée sauvegardée.")
+        except Exception as e:
+            print(f"   ❌ Erreur SQL (SensorData) : {e}")
+
+    def _log_event(self, event_type, description):
+        """Méthode privée pour écrire dans EventLogs"""
+        try:
+            conn = pyodbc.connect(CONN_STR)
+            cursor = conn.cursor()
+            sql = "INSERT INTO EventLogs (event_type, description) VALUES (?, ?)"
+            cursor.execute(sql, (event_type, description))
+            conn.commit()
+            cursor.close()
+            conn.close()
+            print(f"   └── 📝 Log ajouté : {description}")
+        except Exception as e:
+            print(f"   ❌ Erreur SQL (EventLogs) : {e}")
+
+# --- LANCEMENT DU SERVEUR PYRO4 ---
 def start_server():
-    print(f"⏳ Starting Daemon on {HOST}:{PORT}...")
-    try:
-        daemon = Pyro4.Daemon(host=HOST, port=PORT)
-        uri = daemon.register(SafeHouseServer, OBJ_ID)
-        
-        print("="*40)
-        print(f"🏠 RPC SERVER ONLINE (Database Connected)")
-        print(f"🔗 URI: PYRO:{OBJ_ID}@{HOST}:{PORT}")
-        print("="*40, flush=True)
-        
-        daemon.requestLoop()
-    except Exception as e:
-        print(f"❌ Fatal Error: {e}")
+    daemon = Pyro4.Daemon(port=8000)
+    uri = daemon.register(SafeHouseServer, "safehouse")
+    
+    print(f"🔥 Serveur Pyro4 en écoute sur : {uri}")
+    print("   (Laissez cette fenêtre ouverte !)")
+    
+    daemon.requestLoop()
 
 if __name__ == "__main__":
     start_server()
